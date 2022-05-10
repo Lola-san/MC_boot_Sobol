@@ -1,0 +1,408 @@
+---
+title: "Déroulé bootstrapping, Monte-Carlo et analyse de sensibilité de Sobol"
+author: "Lola Gilbert"
+date: "10/05/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE )
+```
+
+## Aim
+
+This document aims to show how I decomposed my analysis with an emphasis on steps of bootstrapping, modelling with Monte-Carlo simulations and global sensitivity analysis of Sobol. I used a simplified dataset for the composition of prey, and used dummy data for the rest (abundance and diets of predators species). 
+
+# Dataset preparation 
+To ease computation, I used a specific table structure, with tibbles inside of tibbles.
+
+Define abundances for 3 species in the Northeast Atlantic area (NEA) and add relevant bioenergetic data (mass and beta). 
+```{r  abundances}
+
+data <- tibble::tribble(~ species, ~ area, ~ abundance, ~ a_CV, ~ mass, ~ beta, 
+                        "Bala_acu", "NEA", 10000, 0.48, 6500, 4,
+                        "Delp_del", "NEA", 150000, 0.32, 80, 4,
+                        "Glob_mel", "NEA", 22070, 0.22, 850, 3) |> 
+  # add variability around mass and beta 
+  dplyr::mutate(mass_min = mass - mass*0.1, 
+                mass_max = mass + mass*0.1, 
+                beta_min = beta - 0.5,
+                beta_max = beta + 0.5) |> 
+  # nest data in dedicated columns 
+  tidyr::nest(mass = c(mass, 
+                       mass_min, 
+                       mass_max), 
+              beta = c(beta, beta_min, beta_max), 
+              abund = c(abundance, a_CV))
+  
+```
+
+Define dummy diets for these 3 species using defined prey groups, defining % of weight of prey group in each species' diet, and dummy excretion rate per element 
+
+```{r  diets}
+
+data <- data |> 
+  dplyr::mutate(`Large demersal energy-lean fish` = dplyr::case_when(species == "Bala_acu" ~ 10, 
+                                                                     species == "Delp_del" ~ 5,
+                                                                     species == "Glob_mel" ~ 0),
+                `Large demersal energy-rich fish` = dplyr::case_when(species == "Bala_acu" ~ 20, 
+                                                                     species == "Delp_del" ~ 5,
+                                                                     species == "Glob_mel" ~ 0), 
+                `Small schooling energy-lean fish` = dplyr::case_when(species == "Bala_acu" ~ 10, 
+                                                                     species == "Delp_del" ~ 10,
+                                                                     species == "Glob_mel" ~ 10), 
+                `Small schooling energy-rich fish` = dplyr::case_when(species == "Bala_acu" ~ 60, 
+                                                                     species == "Delp_del" ~ 70,
+                                                                     species == "Glob_mel" ~ 10), 
+                `Miscellanous benthodemersal fish` = dplyr::case_when(species == "Bala_acu" ~ 0, 
+                                                                     species == "Delp_del" ~ 5,
+                                                                     species == "Glob_mel" ~ 5),
+                `Miscellanous pelagic fish` = dplyr::case_when(species == "Bala_acu" ~ 0, 
+                                                               species == "Delp_del" ~ 0,
+                                                               species == "Glob_mel" ~ 5), 
+                `Muscular pelagic cephalopods` = dplyr::case_when(species == "Bala_acu" ~ 0, 
+                                                                  species == "Delp_del" ~ 5,
+                                                                  species == "Glob_mel" ~ 50), 
+                `Bottom cephalopods` = dplyr::case_when(species == "Bala_acu" ~ 0, 
+                                                        species == "Delp_del" ~ 0,
+                                                        species == "Glob_mel" ~ 20)
+                ) |> 
+  # nest data in dedicated column
+  tidyr::nest(diet = c(`Large demersal energy-lean fish`:`Bottom cephalopods`)) |> 
+  dplyr::mutate(nut_exc = seq_along(species) |>
+                  purrr::map(~ tibble::tibble(N = 0.8, 
+                                              P = 0.7, 
+                                              As = 0.9,
+                                              Co = 0.9,
+                                              Cu = 0.9,
+                                              Fe = 0.9,
+                                              Mn = 0.9,
+                                              Se = 0.9,
+                                              Zn = 0.9)))
+  
+```
+
+Take a look at the dataset: 
+
+```{r data glimpse}
+# to disable scientific notations
+options(scipen = 999)
+
+knitr::kable(data, 
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+Some cells are tibbles, and in this case the name of the columns are not displayed here. But they are visible when we look at the cell in particular, say for the diet for instance, for the first 
+
+```{r data diet glimpse}
+# to disable scientific notations
+options(scipen = 999)
+
+knitr::kable(purrr::pluck(data, "diet", 1),
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+For the definition of the diet, we have for each species i:
+
+$$ W_{PGi,1} + W_{PGi,2} + W_{PGi,3} + W_{PGi,4} + W_{PGi,5} + W_{PGi,6} + W_{PGi,7} + W_{PGi,8} = 100 $$
+
+
+# Compute the mean elemental concentration of each predator species diet - Bootstrapping as I did it in the first place
+
+We want to compute for each predator species, the mean elemental concentration of its diet based on its relative consumption of each prey group and on the composition of each prey group. This is where I used bootstrapping : we have a dataset with the elemental concentration of a range of prey species, each being associated to a prey group (the same used for the definition of diets of predators). 
+
+A glimpse of the dataset with the composition of preys: 
+
+```{r data glimpse compo}
+# load dataset
+load("data/Sample_dataset_LG_20220314.RData")
+
+knitr::kable(head(nutri_df), 
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+I kept 8 prey groups for the example 
+
+```{r data PG}
+unique(nutri_df$Prey_group)
+```
+
+The idea is to bootstrap this composition dataset to get nsim (nb of simulation that will be also used for the Monte-Carlo simulations after this, here we'll take nsim = 100) sample per prey group, and then use these bootstrapped composition data to compute the mean composition of the diet. 
+
+I used here a basic sampling function... 
+
+```{r bootstrap LG}
+nsim <- 1e2
+
+nutri_df <- nutri_df |>
+  dplyr::group_by(Prey_group) |>
+  dplyr::slice_sample(n = nsim, replace = TRUE)
+```
+
+```{r verif}
+nutri_df |>
+  dplyr::group_by(Prey_group) |>
+  dplyr::summarize(n = dplyr::n())
+```
+
+So, for each prey group j, we have $(N_{j,1}, N_{j,2}, ..., N_{j,100})$, $(P_{j,1}, P_{j,2}, ..., P_{j,100})$, $(Fe_{j,1}, Fe_{j,2}, ..., Fe_{j,100})$, etc, for each element. 
+
+Originally, the diet data for the predator is defined in the column `diet` of `data`, as tibble with one line and 8 columns, as for the first species: 
+
+```{r data glimpse diet}
+knitr::kable(purrr::pluck(data, "diet", 1), 
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+I then transform it in another column in the longer format, to replicate the %W per prey group data and associate each with a sample of the elemental composition of the associated prey group (so there will be 100 rows per prey group in the secondary diet tibble). 
+
+```{r diet transfo1}
+full_data <- data |>
+  dplyr::mutate(nut_W = seq_along(diet) |>
+                  purrr::map(~ purrr::pluck(diet, .) |>
+                        tidyr::pivot_longer(cols = c('Large demersal energy-lean fish':'Bottom cephalopods'),
+                                     names_to = "Prey_group",
+                                     values_to = "W") |>
+                        # join to get a composition sample associated to each prey group
+                        dplyr::left_join(y = nutri_df,
+                                  by = "Prey_group")
+                   ))
+  
+
+knitr::kable(head(purrr::pluck(full_data, "nut_W", 1), n = 6), 
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+Then, I compute W*elemental concentration for each prey group and each bootstrap sample associated to the prey group. For each predator species, we will thus have $(W_{PGj}\times N_{j,1}, W_{PGj}\times N_{j,2}, ..., W_{PGj}\times N_{j,100})$, $(W_{PGj}\times P_{j,1}, W_{PGj}\times P_{j,2}, ..., W_{PGj}\times P_{j,100})$, $(W_{PGj}\times Fe_{j,1}, W_{PGj}\times Fe_{j,2}, ..., W_{PGj}\times Fe_{j,100})$, etc, for each element and each prey group j (and each predator species i, but I dropped i subscript here). 
+
+```{r diet transfo2}
+full_data <- full_data |>
+  dplyr::mutate(
+    nut_W = seq_along(nut_W) |>
+      purrr::map(~ purrr::pluck(nut_W, .) |>
+                   # compute W*elemental concentration
+                   dplyr::mutate(NRJ = NRJ*(W/100), 
+                                 N = N*(W/100),
+                                 P = P*(W/100),
+                                 Fe = Fe*(W/100),
+                                 Se = Se*(W/100),
+                                 Cu = Cu*(W/100),
+                                 Zn = Zn*(W/100),
+                                 Mn = Mn*(W/100),
+                                 Co = Co*(W/100),
+                                 As = As*(W/100)) |>
+                   # change it to get one column per prey_group
+                   # and one line, each cell containing a full bootstrap tibble 
+                   # of elemental concentration, size nsim*nelements
+                   # corresponding to the prey group of the column
+                   dplyr::select(-c(W)) |>
+                   tidyr::nest(Nut = c("NRJ":"Zn")) |>
+                   tidyr::pivot_wider(names_from = Prey_group, 
+                                      values_from = Nut)))
+
+```
+
+So each nut_W cell contains a tibble with one column per prey group, and one row, each cell of this tibble being another tibble with one column per element and nsim rows, containing the $(W_{PGj}\times N_{j,1}, W_{PGj}\times N_{j,2}, ..., W_{PGj}\times N_{j,100})$, $(W_{PGj}\times P_{j,1}, W_{PGj}\times P_{j,2}, ..., W_{PGj}\times P_{j,100})$, $(W_{PGj}\times Fe_{j,1}, W_{PGj}\times Fe_{j,2}, ..., W_{PGj}\times Fe_{j,100})$, etc:
+
+```{r diet glimpse after transfo }
+# See for instance the sample of the composition of the diet portion corresponding to the consumption of
+# the first prey group by the first predator species (first 6 rows):
+knitr::kable(head(as.data.frame(purrr::pluck(full_data, "nut_W", 1, 1)), n = 6), 
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+Then, to get the mean elemental concentration of the diet of species i, we need to compute: 
+
+$$ N_1 = W_{PG1}\times N_{1,1} + W_{PG2}\times N_{2,1} + W_{PG3}\times N_{3,1} + W_{PG4}\times N_{4,1} + W_{PG5}\times N_{5,1} + W_{PG6}\times N_{6,1} + W_{PG7}\times N_{7,1} + W_{PG8}\times N_{8,1} $$ 
+
+$N_1$ being the mean N elemental concentration of the diet of i associated to sample 1. So we have to compute this sum for each sample, each element and each predator species. 
+
+```{r diet transfo3}
+full_data <- full_data |>
+  dplyr::mutate(# compute the mean concentration of diet by summing these values across prey_groups
+         nut_diet = seq_along(nut_W) |>
+           purrr::map(~ purrr::pluck(nut_W, ., 1, 1) +
+                        purrr::pluck(nut_W, ., 2, 1) +
+                        purrr::pluck(nut_W, ., 3, 1) +
+                        purrr::pluck(nut_W, ., 4, 1) +
+                        purrr::pluck(nut_W, ., 5, 1) +
+                        purrr::pluck(nut_W, ., 6, 1) +
+                        purrr::pluck(nut_W, ., 7, 1) +
+                        purrr::pluck(nut_W, ., 8, 1) ), 
+         # NRJ should be a separated column as it will be used to compute the daily ration
+         NRJ_diet = seq_along(nut_diet) |>
+           purrr::map(~ tibble::as_tibble_col(purrr::pluck(nut_diet, ., "NRJ")*1e3)), # from kJ per g to kJ per kg
+         # delete it from nut_diet tibbles 
+         nut_diet = seq_along(nut_diet) |>
+           purrr::map(~ purrr::pluck(nut_diet, .) |>
+                 dplyr::select(-NRJ))
+         ) |>
+  dplyr::select(-c(nut_W))
+
+```
+
+So now for each predator species, there is a table of the mean elemental concentration of diet considering the variability in the concentration of each prey group, with nsim rows, as here for the first species: 
+
+```{r nut_diet glimpse}
+# See for instance the sample of the composition of the diet portion corresponding to the consumption of
+# the first prey group by the first predator species (first 6 rows):
+knitr::kable(head(as.data.frame(purrr::pluck(full_data, "nut_diet", 1)), n = 6), 
+             align = 'c' , 
+             booktabs = TRUE) |>
+  kableExtra::kable_styling()
+
+```
+
+It is these variables (the mean elemental composition of diets, $(N_1, N_2, ... N_100), (P_1, ..., P_{100}), etc$) that I consider to be parameters of the model in the following calculation. So it's not directly the bootstrapped parameters, but it results from a calculation involving the bootstrapped parameters. 
+
+## Monte-Carlo modelling 
+
+Using the same table structure I do the computation row by row and cell and by cell, cells being sometimes vectors or tables. 
+
+```{r include = FALSE}
+####################### PRELIMINARY FUNCTIONS ##################################
+# to compute standard error from a min and a max
+approx_se <- function(lower, upper) { return((upper-lower)/4) }
+
+# to simulate abundance uncertainty
+abundance <- function(abund_bar, abund_cv,
+                      n_sim){
+  sigma <- sqrt(log1p(abund_cv*abund_cv))
+  mu <- log(abund_bar/sqrt(1+abund_cv*abund_cv))
+  return(tibble::as_tibble_col(rlnorm(n_sim, mu, sigma))) 
+} # lognormal distribution commonly used for species abundances 
+
+# to compute the daily need of an individual (Kleber equation) of a given species
+kleber <- function(beta, mass, n_sim, 
+                   assimil_mean = NULL,  assimil_se = 0.05,
+                   dietQuality
+) {
+  # should the daily ration be computed?
+  if(!is.null(assimil_mean) && !is.null(dietQuality)) {
+    a <- rnorm(n_sim, assimil_mean, assimil_se) # assimilation 
+    
+    return(tibble::tibble(ADMR = beta * (293.1*mass^(3/4)),
+                  A_rate = a,
+                  Ration = beta * (293.1*mass^(3/4))/(a*dietQuality),
+                  PercentBM = 293.1*beta/(a*dietQuality*mass^(1/4)))
+    )
+  }
+  else { return(list(ADMR = beta * (293.1*mass^(3/4)))) }
+}
+
+```
+
+``` {r }
+
+############################# COMPUTATION ######################################
+computed_data <- full_data |> 
+  dplyr::mutate(###### SIMULATE UNCERTAINTY IN mass, beta, abundANCE DATA, EXCRETION
+    abund = seq_along(abund) |> 
+      purrr::map(~ abundance(abund[[.]]$abundance,
+                             abund[[.]]$a_CV, 
+                             nsim)), 
+    mass = seq_along(mass) |>
+      purrr::map(~ tibble::as_tibble_col(rnorm(nsim, 
+                                               mass[[.]]$mass, 
+                                               approx_se(mass[[.]]$mass_min,
+                                                         mass[[.]]$mass_max)))), 
+    beta = seq_along(beta) |>
+      purrr::map(~ tibble::as_tibble_col(rnorm(nsim, 
+                                               beta[[.]]$beta, 
+                                               approx_se(beta[[.]]$beta_min,
+                                                         beta[[.]]$beta_max)))), 
+    nut_exc = seq_along(nut_exc) |> # nutrient excretion rate
+      purrr::map(~ tibble::tibble(N = runif(n = nsim,
+                                            min = nut_exc[[.]]$N - 0.1, 
+                                            max = nut_exc[[.]]$N + 0.1), 
+                   P = runif(n = nsim,
+                             min = nut_exc[[.]]$P - 0.15, 
+                             max = nut_exc[[.]]$P + 0.1),
+                   As = dplyr::case_when(nut_exc[[.]]$As == 0 ~ runif(n = nsim,     
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$As - 0.05, 
+                                               max = nut_exc[[.]]$As + 0.05)),
+                   Co = dplyr::case_when(nut_exc[[.]]$Co == 0 ~ runif(n = nsim, 
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$Co - 0.05, 
+                                               max = nut_exc[[.]]$Co + 0.05)),
+                   Cu = dplyr::case_when(nut_exc[[.]]$Cu == 0 ~ runif(n = nsim, 
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$Cu - 0.05, 
+                                               max = nut_exc[[.]]$Cu + 0.05)),
+                   Fe = dplyr::case_when(nut_exc[[.]]$Fe == 0 ~ runif(n = nsim,       
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$Fe - 0.05, 
+                                               max = nut_exc[[.]]$Fe + 0.05)),
+                   Mn = dplyr::case_when(nut_exc[[.]]$Mn == 0 ~ runif(n = nsim, 
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$Mn - 0.05, 
+                                               max = nut_exc[[.]]$Mn + 0.05)),
+                   Se = dplyr::case_when(nut_exc[[.]]$Se == 0 ~ runif(n = nsim, 
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$Se - 0.05, 
+                                               max = nut_exc[[.]]$Se + 0.05)),
+                   Zn = dplyr::case_when(nut_exc[[.]]$Zn == 0 ~ runif(n = nsim,
+                                                                      min = 0, 
+                                                                      max = 0),
+                                  TRUE ~ runif(n = nsim,                              
+                                               min = nut_exc[[.]]$Zn - 0.05, 
+                                               max = nut_exc[[.]]$Zn + 0.05)))), 
+    ############################ COMPUTE INDIVIDUAL NRJTIC DATA, NEEDS AND CONSUMPTION OF POP ######  
+    Indi_data = seq_along(mass) |>
+      purrr::map(~ kleber(beta = purrr::pluck(beta, ., 1), mass = purrr::pluck(mass, ., 1), n_sim = nsim, 
+                   assimil_mean = 0.8, assimil_se = 0.05, 
+                   dietQuality = purrr::pluck(NRJ_diet, ., 1))), 
+    # Population consumption and needs
+    conso_pop = seq_along(abund) |> # Annual amount of prey consumed by the population in kg
+      purrr::map(~ purrr::pluck(abund, ., 1)*365*purrr::pluck(Indi_data, ., "Ration")), 
+    Needs_pop = seq_along(abund) |> # Annual need of the population in kJ
+      purrr::map(~ purrr::pluck(abund, ., 1)*365*purrr::pluck(Indi_data, ., "ADMR")), 
+    # change % to proportion for diet data 
+    Diet = seq_along(diet) |>
+      purrr::map(~ tidyr::uncount(purrr::pluck(diet, .)/100, nsim)), # the unique line to get the same dimensions as vector to be multiplied by 
+    
+    
+    ## NUTRIENT CONSUMPTION AND EXCRETION 
+         conso_nut = seq_along(conso_pop) |> # Annual consumption of nutrient
+           purrr::map(~ (purrr::pluck(conso_pop, .) * purrr::pluck(nut_diet, .))/1e9), # from mg to tonnes 
+         excrete_nut = seq_along(conso_nut) |> # Annual excretion of nutrient 
+           purrr::map(~ purrr::pluck(conso_nut, .) * purrr::pluck(nut_exc, .))
+  )
+
+```
+
+
+## Sensitivity analysis using `sensobol`
+
+
