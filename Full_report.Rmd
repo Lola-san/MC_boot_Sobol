@@ -13,6 +13,8 @@ knitr::opts_chunk$set(echo = TRUE, message = FALSE )
 
 This document aims to show how I decomposed my analysis with an emphasis on steps of bootstrapping, modelling with Monte-Carlo simulations and global sensitivity analysis of Sobol. I used a simplified dataset for the composition of prey, and used dummy data for the rest (abundance and diets of predators species). 
 
+I'll highlight where I have trouble understanding how to apply to bootstrapp procedure you suggest to my data, or the sensitivity analysis on the parameters resulting from the bootstrapping. 
+
 # Dataset preparation 
 To ease computation, I used a specific table structure, with tibbles inside of tibbles.
 
@@ -95,7 +97,7 @@ knitr::kable(data,
 
 ```
 
-Some cells are tibbles, and in this case the name of the columns are not displayed here. But they are visible when we look at the cell in particular, say for the diet for instance, for the first 
+Some cells are tibbles, and in this case the name of the columns are not displayed here. But they are visible when we look at the cell in particular, say for the diet for instance, for the first species:
 
 ```{r data diet glimpse}
 # to disable scientific notations
@@ -116,6 +118,12 @@ $$ W_{PGi,1} + W_{PGi,2} + W_{PGi,3} + W_{PGi,4} + W_{PGi,5} + W_{PGi,6} + W_{PG
 # Compute the mean elemental concentration of each predator species diet - Bootstrapping as I did it in the first place
 
 We want to compute for each predator species, the mean elemental concentration of its diet based on its relative consumption of each prey group and on the composition of each prey group. This is where I used bootstrapping : we have a dataset with the elemental concentration of a range of prey species, each being associated to a prey group (the same used for the definition of diets of predators). 
+
+I want to use bootstrapping for two reasons: 
+
+* we could compute statistical descriptors (mean, CV, min, max) to define the composition of each prey group and then use this in a Monte-Carlo procedure to do simulations, but then we would not know what distribution to apply to them. This would be a total guess... a normal distribution? a uniform ? 
+
+* we have a few samples per prey group, so it makes sense to give value to them! 
 
 A glimpse of the dataset with the composition of preys: 
 
@@ -273,6 +281,16 @@ knitr::kable(head(as.data.frame(purrr::pluck(full_data, "nut_diet", 1)), n = 6),
 
 It is these variables (the mean elemental composition of diets, $(N_1, N_2, ... N_100), (P_1, ..., P_{100}), etc$) that I consider to be parameters of the model in the following calculation. So it's not directly the bootstrapped parameters, but it results from a calculation involving the bootstrapped parameters. 
 
+**I have two problems to apply the bootstrapp procedure that you suggest would be best to better respect the conditions to compute Sobol sensitivity analysis:** 
+
+* **I apply bootstrapping on samples of prey groups, but I have not the same number of samples for each prey group, and in particular I have one prey group with just one sample. Would it be acceptable to use one of the procedure you suggest for all prey groups but this one, and just use basic replicates for the last group with just one sample (which is what I am using at the moment with the basic sampling procedure) ? Of what I tested, there is a sufficient number of samples in the other prey groups for the procedures to work (minimum being 14 samples).**
+
+* **as just mentioned, what I consider to be parameters of the model are not directly the bootstrapped samples but the result from a calculation involving these samples (mean elemental content of the diet and mean nrj content of the diet). Parameters involved in the calculation to obtain these "true" model parameters are the %W (ie % of prey group, in weight, in the diet of the species) of all prey groups, that do not vary, and the nutrient concentration of each prey group (all resulting from the bootstrapp procedure). Is this a problem for the sensitivity analysis ?**
+
+
+
+
+
 ## Monte-Carlo modelling 
 
 Using the same table structure I do the computation row by row and cell and by cell, cells being sometimes vectors or tables. 
@@ -394,15 +412,126 @@ computed_data <- full_data |>
     
     
     ## NUTRIENT CONSUMPTION AND EXCRETION 
-         conso_nut = seq_along(conso_pop) |> # Annual consumption of nutrient
-           purrr::map(~ (purrr::pluck(conso_pop, .) * purrr::pluck(nut_diet, .))/1e9), # from mg to tonnes 
-         excrete_nut = seq_along(conso_nut) |> # Annual excretion of nutrient 
-           purrr::map(~ purrr::pluck(conso_nut, .) * purrr::pluck(nut_exc, .))
+    conso_nut = seq_along(conso_pop) |> # Annual consumption of nutrient
+      purrr::map(~ (purrr::pluck(conso_pop, .) * purrr::pluck(nut_diet, .))/1e9), # from mg to tonnes
+    excrete_nut = seq_along(conso_nut) |> # Annual excretion of nutrient 
+      purrr::map(~ purrr::pluck(conso_nut, .) * purrr::pluck(nut_exc, .))
   )
 
 ```
 
+The output of interest is `excrete_nut`. 
+
 
 ## Sensitivity analysis using `sensobol`
 
+I used the package `sensobol` presented in Puy et al. 2021 (in the References folder) as being more efficient than `sensivity`. Plus I found the example given quite clear so that I could use it in my case. I'll show how I have done it in my case to highlight where I'm having trouble seeing how I could integrate parameters resulting from the bootstrapp process in the analysis.
 
+I'll show here the analysis for one species (the first one) and one nutrient (N) only, but I used a function to compute first-order and total Sobol indices for all species, all locations and all elements. 
+
+There are 5 parameters that can be included in the sensitivity analysis: the abundance of the predator species, the mass, beta, the assimilation rate and the nutrient excretion rate. Two other parameters are resulting from the bootstrapp process (again, while not being directly the bootstrapped samples) : the mean NRJ content and the mean nutrient content of the diet. 
+
+It is based on the second example exposed in Puy et al. 2021.
+
+```{r}
+rw <- 1 # just do it for the first species (ie the first row)
+
+# create function to compute output from the matrices of parameters (one for MC parameters and one for bootstrapped parameters)
+compute_y <- function(param_mat, bootstrap_mat) {
+  ADMR <- param_mat[, "beta"]*293.1*(param_mat[, "mass"]^0.75)
+  Ration <- ADMR / (param_mat[, "A_rate"]*purrr::pluck(bootstrap_mat, "NRJ_diet"))
+  conso_pop <- param_mat[, "abund"]*365*Ration
+  conso_nut <- (conso_pop*purrr::pluck(bootstrap_mat, "nut_diet"))/1e9
+  excrete_nut <- conso_nut*param_mat[, "nut_exc"]
+  
+  return(excrete_nut)
+}
+
+# 1 - set parameters for the sensitivity analysis 
+N <- 1e2 # nb of samples
+R <- 10^3 # nb of bootstrap replicas
+type <- "norm" # bootstrap confidence interval method
+conf <- 0.95 # length of the confidence interval
+paramsN <- c("abund", "mass", "beta", 
+             "A_rate", "nut_exc")
+  
+# 2 - construct the sample matrix of inputs
+matN <- sensobol::sobol_matrices(N = N, params = paramsN)
+  
+# 3 - change distributions of inputs according to data or bibliography/assumptions
+matN[, "abund"] <- qlnorm(matN[, "abund"],
+                          meanlog = log(purrr::pluck(full_data, 
+                                                     "abund", 
+                                                     rw, 
+                                                     "abundance") /sqrt(1 + purrr::pluck(full_data, 
+                                                                                     "abund", 
+                                                                                     rw, 
+                                                                                     "a_CV")*purrr::pluck(full_data,
+                                                                                                          "abund", 
+                                                                                                          rw,
+                                                                                                          "a_CV"))),
+                          sdlog = sqrt(log1p(purrr::pluck(full_data, 
+                                                          "abund", 
+                                                          rw, 
+                                                          "a_CV")*purrr::pluck(full_data, 
+                                                                                   "abund", 
+                                                                                   rw, 
+                                                                                   "a_CV"))))
+matN[, "mass"] <- qnorm(matN[, "mass"], 
+                        mean = purrr::pluck(full_data, "mass", rw, "mass"), 
+                        sd = (purrr::pluck(full_data, "mass", rw, "mass_max")-purrr::pluck(full_data, "mass", rw, "mass_min"))/4)
+matN[, "beta"] <- qnorm(matN[, "beta"], 
+                        mean = purrr::pluck(full_data, "beta", rw, "beta"), 
+                        sd = (purrr::pluck(full_data, "beta", rw, "beta_max")-purrr::pluck(full_data, "beta", rw, "beta_min"))/4)
+matN[, "A_rate"] <- qnorm(matN[, "A_rate"], mean = 0.8, sd = 0.1*0.025)
+matN[, "nut_exc"] <- qunif(matN[, "nut_exc"], 
+                           min = purrr::pluck(full_data, "nut_exc", rw, "N") - 0.1,  
+                           max = purrr::pluck(full_data, "nut_exc", rw, "N") + 0.1)
+  
+  
+mat_bootstrap_par <- tibble::tibble(NRJ_diet = purrr::pluck(full_data, "NRJ_diet", rw, 1),
+                                    nut_diet = purrr::pluck(full_data, "nut_diet", rw, "N"))
+  
+# 4 - compute output
+yN <- compute_y(matN, mat_bootstrap_par)
+  
+# 5 - compute sensitivity indices 
+indN <- sensobol::sobol_indices(Y = yN, N = N, params = paramsN, 
+                      boot = TRUE, R = R, type = type, conf = conf)
+cols <- colnames(indN$results)[1:5]
+indN$results[, (cols):= round(.SD, 3), .SDcols = (cols)]
+
+# 6 -compute sobol indices of dummy parameters ie parameters 
+# that do not influence the model output, 
+# to estimate the approximation error 
+indN.dummy <- sensobol::sobol_dummy(Y = yN, N = N, params = paramsN, 
+                         boot = TRUE, R = R)
+
+# 7 - identify parameters whose contribution to the output variance is less than the approximation error and can not be considered influential
+# dashed lines mark the upper limit of Ti (blue) and Si (red)
+plot(indN, dummy = indN.dummy)
+  
+```
+
+The blue and red dotted lines are the limits of the dummy parameters first-order and total Sobol indices, respectively. When computed indices are above these levels it means the influence of the associated parameter on the output is significant. 
+
+Where I have trouble figuring out how I could include the bootstrapped parameters is the step 4, as I can't attribute neither a distribution law or quantile function to them. 
+
+We can't still look at basic scatter plots between these parameters and the output: 
+
+```{r}
+ggplot2::ggplot() +
+  ggplot2::geom_point(ggplot2::aes(x = purrr::pluck(computed_data, "NRJ_diet", 1, 1), y = purrr::pluck(computed_data, "excrete_nut", 1, "N")))
+```
+
+
+```{r}
+ggplot2::ggplot() +
+  ggplot2::geom_point(ggplot2::aes(x = purrr::pluck(computed_data, "nut_diet", 1, "N"), y = purrr::pluck(computed_data, "excrete_nut", 1, "N")))
+```
+
+These do not suggest a strong influence of the parameters on the output, but still... It would be better to include them in the sensitivity analysis! 
+
+**If I understood the bootstrapp processes you suggest I could use well, from one of them I could estimate these functions from the data (ie the samples of `nut_diet` and `NRJ_diet` resulting indirectly from the bootstrapping), is this correct ?**
+
+**If so, then I would use one the bootstrapp process both to resample the composition of prey groups, and to estimate the distribution function of the parameters of the models resulting from a calculation involving these first bootstrapped samples. Is this okay ?**
